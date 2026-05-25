@@ -228,6 +228,144 @@ def package_name(mod: str) -> str:
     return mod.split("/")[0]
 
 
+# ── Workspace-alias resolution (tsconfig paths + vite resolve.alias) ──────────
+# Monorepos remap bare specifiers like `@clubschedule/api-contract` or `@spa/x`
+# to in-repo source files. Without this, every cross-package import collapses to
+# an opaque external node and cross-package edges (the ones a layer-boundary
+# check needs) are invisible. Two alias shapes are supported:
+#   exact   — full specifier maps to one file:  "@clubschedule/db" -> packages/db/src/index.ts
+#   prefix  — specifier prefix maps to a dir:    "@spa" -> apps/spa/src   (so "@spa/foo" -> apps/spa/src/foo)
+_JSONC_LINE_COMMENT = re.compile(r"(^|\s)//.*$", re.MULTILINE)
+_JSONC_BLOCK_COMMENT = re.compile(r"/\*.*?\*/", re.DOTALL)
+_TRAILING_COMMA = re.compile(r",(\s*[}\]])")
+# vite/webpack-style:  '@spa': fileURLToPath(new URL('../spa/src', import.meta.url))
+#                      '@spa': path.resolve(__dirname, '../spa/src')
+_VITE_ALIAS_RE = re.compile(
+    r"""['"]([@\w./-]+)['"]\s*:\s*"""
+    r"""(?:fileURLToPath\s*\(\s*new\s+URL\s*\(\s*['"]([^'"]+)['"]"""
+    r"""|(?:path\.)?resolve\s*\([^,]*,\s*['"]([^'"]+)['"]"""
+    r"""|['"]([^'"]+)['"])""",
+)
+
+
+def _load_jsonc(path: Path):
+    """Parse a JSON-with-comments file (tsconfig). Returns {} on any failure."""
+    try:
+        raw = path.read_text(errors="replace")
+    except OSError:
+        return {}
+    raw = _JSONC_BLOCK_COMMENT.sub("", raw)
+    raw = _JSONC_LINE_COMMENT.sub(r"\1", raw)
+    raw = _TRAILING_COMMA.sub(r"\1", raw)
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        return {}
+
+
+def load_workspace_aliases(root: Path):
+    """
+    Scan tsconfig*.json `compilerOptions.paths` and vite/*.config.* `resolve.alias`
+    across the repo. Returns (exact, prefix):
+      exact  : {specifier -> abs target file}        e.g. "@clubschedule/db" -> <root>/packages/db/src/index.ts
+      prefix : [(specifier_prefix, abs target dir)]   e.g. ("@spa", <root>/apps/spa/src)
+    Longest-prefix-first so "@clubschedule/db/hydrators" wins over "@clubschedule/db".
+    """
+    exact: dict[str, Path] = {}
+    prefix: dict[str, Path] = {}
+
+    # 1) tsconfig paths (authoritative for tsc-resolved aliases)
+    for ts in root.rglob("tsconfig*.json"):
+        if is_skip_dir(ts):
+            continue
+        cfg = _load_jsonc(ts)
+        base_url = cfg.get("compilerOptions", {}).get("baseUrl", ".")
+        ts_base = (ts.parent / base_url).resolve()
+        paths = cfg.get("compilerOptions", {}).get("paths", {}) or {}
+        for spec, targets in paths.items():
+            if not targets:
+                continue
+            target = (ts_base / targets[0]).resolve()
+            if spec.endswith("/*"):
+                prefix.setdefault(spec[:-2], target)  # strip "/*"
+            else:
+                # could be a file (has suffix) or a dir-as-prefix
+                if target.suffix:
+                    exact.setdefault(spec, target)
+                else:
+                    prefix.setdefault(spec, target)
+
+    # 2) vite / build-config resolve.alias (catches @spa-style prefix maps tsc doesn't carry)
+    for cfg_name in ("vite.config.ts", "vite.config.js", "vite.config.mjs"):
+        for vc in root.rglob(cfg_name):
+            if is_skip_dir(vc):
+                continue
+            try:
+                src = vc.read_text(errors="replace")
+            except OSError:
+                continue
+            for m in _VITE_ALIAS_RE.finditer(src):
+                spec = m.group(1)
+                rel = m.group(2) or m.group(3) or m.group(4)
+                if not spec or not rel or rel.startswith("@"):
+                    continue
+                target = (vc.parent / rel).resolve()
+                if target.suffix:
+                    exact.setdefault(spec, target)
+                else:
+                    prefix.setdefault(spec, target)
+
+    prefix_sorted = sorted(prefix.items(), key=lambda kv: len(kv[0]), reverse=True)
+    return exact, prefix_sorted
+
+
+def resolve_alias(mod: str, root: Path, all_files: set, exact: dict, prefix: list):
+    """
+    Resolve a bare/aliased specifier to a repo-relative file via workspace aliases.
+    Returns the repo-relative path string, or None if no alias matches a real file.
+    """
+    target = None
+    if mod in exact:
+        target = exact[mod]
+    else:
+        for spec, base in prefix:
+            if mod == spec or mod.startswith(spec + "/"):
+                rest = mod[len(spec):].lstrip("/")
+                target = (base / rest).resolve() if rest else base
+                break
+    if target is None:
+        return None
+    return _land_on_file(target, root, all_files)
+
+
+def _land_on_file(target: Path, root: Path, all_files: set):
+    """Given an abs path with or without extension, find the real repo-relative file."""
+    # Alias targets are built with .resolve() (symlink-canonicalized); resolve root
+    # too so relative_to() works when root is reached through a symlink (e.g. /tmp,
+    # /var on macOS, some CI checkouts). Without this, resolution silently fails.
+    root = root.resolve()
+    all_extensions = list(JS_EXTENSIONS) + [".css", ".scss", ".sass", ".less"]
+    candidates = [target]
+    if not target.suffix:
+        candidates = [target.with_suffix(ext) for ext in all_extensions] + candidates
+    for cand in candidates:
+        try:
+            rel = str(cand.relative_to(root))
+            if rel in all_files:
+                return rel
+        except ValueError:
+            continue
+    for idx_name in ("index.ts", "index.tsx", "index.js", "index.jsx", "index.vue"):
+        cand = target / idx_name
+        try:
+            rel = str(cand.relative_to(root))
+            if rel in all_files:
+                return rel
+        except ValueError:
+            continue
+    return None
+
+
 def analyze(root: Path, group_map: dict):
     """
     Returns (nodes, external_nodes, links_map, meta).
@@ -240,6 +378,7 @@ def analyze(root: Path, group_map: dict):
         return [], [], {}, {"total_files": 0, "total_loc": 0}
 
     _ext_deps, framework, package_manager = read_package_json(root)
+    alias_exact, alias_prefix = load_workspace_aliases(root)
 
     all_rel = {str(f.relative_to(root)) for f in js_files}
     # Also include CSS/stylesheet files so JS→CSS import links can be resolved
@@ -282,6 +421,9 @@ def analyze(root: Path, group_map: dict):
 
         for mod in mods:
             internal = resolve_internal(mod, f, root, all_rel)
+            if not internal and not mod.startswith(".") and not mod.startswith("/"):
+                # Workspace alias (e.g. @clubschedule/api-contract, @spa/components)
+                internal = resolve_alias(mod, root, all_rel, alias_exact, alias_prefix)
             if internal:
                 key = (rel, internal)
                 links_map[key] = links_map.get(key, 0) + 1
