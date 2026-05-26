@@ -343,7 +343,68 @@ def _build_parser() -> argparse.ArgumentParser:
     p_hook.add_argument("--strict", action="store_true", help="Block commit when threshold exceeded")
     p_hook.add_argument("--remove", action="store_true", help="Remove the installed hook")
 
+    # ── gate ──────────────────────────────────────────────────────────────
+    p_gate = sub.add_parser(
+        "gate",
+        help="Evaluate a commit's graph delta against a repo's arch-rules (topology gate)")
+    p_gate.add_argument("sha", help="Commit SHA to gate (its touched files are the delta)")
+    p_gate.add_argument("--repo", default=".", help="Repo root (default: .)")
+    p_gate.add_argument("--index", help="Path to codeindex.json (auto-discovered if omitted)")
+    p_gate.add_argument("--rules", help="Path to the arch-rules doc (default: <repo>/docs/audit-arch.md)")
+    p_gate.add_argument("--baseline", action="store_true",
+                        help="Also run the core→delta diff (builds the parent graph in a temp worktree — slower)")
+    p_gate.add_argument("--json", action="store_true", help="Output findings as JSON")
+
     return parser
+
+
+def _cmd_gate(args: argparse.Namespace) -> None:
+    from codeindex import gate as gatemod
+
+    repo = Path(args.repo).resolve()
+    rules_path = Path(args.rules) if args.rules else repo / "docs" / "audit-arch.md"
+    if not rules_path.exists():
+        print(f"arch-rules doc not found: {rules_path}", file=sys.stderr)
+        sys.exit(2)
+
+    if args.index:
+        graph_path = Path(args.index)
+    else:
+        graph_path = repo / "codeindex.json"
+    if not graph_path.exists():
+        print(f"graph not found: {graph_path} — run `codeindex analyze` first", file=sys.stderr)
+        sys.exit(2)
+
+    rules = gatemod.ArchRules.from_doc(rules_path)
+
+    analyze_fn = None
+    if args.baseline:
+        from codeindex.index import build
+        analyze_fn = lambda wt: [
+            (l["source"], l["target"]) for l in build(str(wt))["links"]
+            if isinstance(l, dict)
+        ]
+
+    findings = gatemod.evaluate(repo, args.sha, graph_path, rules, analyze_fn=analyze_fn)
+
+    if args.json:
+        print(json.dumps([f.__dict__ for f in findings], indent=2))
+    else:
+        blocks = [f for f in findings if f.severity == "block"]
+        warns = [f for f in findings if f.severity == "warn"]
+        infos = [f for f in findings if f.severity == "info"]
+        print(f"gate {args.sha[:9]} — {len(blocks)} block · {len(warns)} warn · {len(infos)} info")
+        for f in blocks:
+            print(f"  \033[31mBLOCK\033[0m [{f.invariant}] {f.detail}")
+        for f in warns:
+            print(f"  \033[33mWARN \033[0m [{f.invariant}] {f.detail}")
+        for f in infos:
+            print(f"  INFO  [{f.invariant}] {f.detail}")
+        if not findings:
+            print("  \033[32mCLEAN\033[0m — delta is layer-contained, no forbidden edge, within blast budget")
+
+    # exit code: 1 if any block (gate fails), 0 otherwise (warns don't fail)
+    sys.exit(1 if any(f.severity == "block" for f in findings) else 0)
 
 
 def main() -> None:
@@ -359,6 +420,7 @@ def main() -> None:
         "dependencies": _cmd_dependencies,
         "high-blast":   _cmd_high_blast,
         "install-hook": _cmd_install_hook,
+        "gate":         _cmd_gate,
     }
     dispatch[args.command](args)
 
