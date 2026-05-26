@@ -108,14 +108,16 @@ def main():
     r.check("spa → contract is NOT forbidden",
             rules.forbidden_hit("apps/spa/src/x.tsx", "packages/contract/src/index.ts") is None)
 
-    print("\nHotspot scoring (the metric, not a gate-run):")
-    # healthy seam: huge fan-in, tiny loc, no churn → LOW pain
-    seam = 64 * 24 * (0 + 1)            # i18n-shaped
-    god  = 209 * 1597 * (15 + 1)         # import.ts-shaped
-    r.check("thin seam (64 fan-in × 24 LOC) scores below warn",
+    print("\nHotspot scoring — fan_in × exports × churn (the metric, not a gate-run):")
+    # healthy seam: huge fan-in, FEW exports, no churn → LOW score
+    seam = 108 * 1 * (1 + 1)             # cn.ts-shaped: 108 importers, 1 export
+    god  = 209 * 33 * (15 + 1)           # import.ts-shaped: 33 exports, churning
+    r.check("thin seam (108 fan-in × 1 export) scores below warn",
             seam < rules.hotspot_warn, f"seam={seam}")
-    r.check("god-module (209 × 1597 × churn) scores above warn",
+    r.check("junk drawer (209 fan-in × 33 exports × churn) scores above warn",
             god >= rules.hotspot_warn, f"god={god}")
+    # export-count is the gaming-resistance property: a cosmetic split that keeps
+    # the same exports (re-export barrel) does NOT lower the count → score holds.
 
     sys.exit(r.summary())
 

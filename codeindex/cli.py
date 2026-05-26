@@ -380,15 +380,16 @@ def _cmd_hotspots(args: argparse.Namespace) -> None:
 
     data = json.loads(graph_path.read_text())
     nodes = {n["id"]: n for n in data.get("nodes", [])}
+    exports = gatemod.load_export_counts(graph_path)
 
     rows = []
     for nid in nodes:
         if not nid.startswith(gatemod.INTERNAL_PREFIXES):
             continue
-        score, fan_in, loc, churn = gatemod.hotspot_score(repo, nid, nodes)
+        score, fan_in, n_exp, churn = gatemod.hotspot_score(repo, nid, nodes, exports)
         if score is not None and score >= args.threshold:
             rows.append({"file": nid, "score": score, "fan_in": fan_in,
-                         "loc": loc, "churn": churn})
+                         "exports": n_exp, "churn": churn})
     rows.sort(key=lambda r: r["score"], reverse=True)
     rows = rows[: args.limit]
 
@@ -398,10 +399,13 @@ def _cmd_hotspots(args: argparse.Namespace) -> None:
     if not rows:
         print("No hotspots (no file with fan-in ≥ 20 above the threshold).")
         return
-    print(f"Hotspots — fan-in × LOC × churn(90d), top {len(rows)}:")
-    print(f"  {'score':>10}  {'fanin':>5} {'loc':>5} {'churn':>5}  file")
+    if not exports:
+        print("(no symbolindex.json — run `codeindex symbols` for export-based scoring; "
+              "falling back to 1× exports)")
+    print(f"Hotspots — fan-in × exports × churn(90d), top {len(rows)}:")
+    print(f"  {'score':>10}  {'fanin':>5} {'exp':>4} {'churn':>5}  file")
     for r in rows:
-        print(f"  {r['score']:>10}  {r['fan_in']:>5} {r['loc']:>5} {r['churn']:>5}  {r['file']}")
+        print(f"  {r['score']:>10}  {r['fan_in']:>5} {r['exports']:>4} {r['churn']:>5}  {r['file']}")
 
 
 def _cmd_gate(args: argparse.Namespace) -> None:

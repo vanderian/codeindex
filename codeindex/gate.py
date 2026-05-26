@@ -10,10 +10,13 @@ and evaluates the touched files of a commit (the delta) against these checks:
   1. layer-containment : BLOCK — no delta edge points UP the layer-rank stack
   2. forbidden-edge     : BLOCK — no delta edge matches a §-backed forbidden rule
   3. hotspot            : WARN (never blocks) when a delta file is a
-                          heavily-depended-on, large, churning module
-                          (fan_in × loc × churn) — a split candidate. Raw blast
-                          does NOT gate: high fan-in to a thin stable seam is
-                          healthy (Martin's stable-dependency rule).
+                          heavily-depended-on, MANY-export, churning module
+                          (fan_in × exports × churn) — a low-cohesion junk drawer.
+                          Raw blast does NOT gate: high fan-in to a thin stable
+                          seam (few exports) is healthy (Martin's stable-dependency
+                          rule). Export-count beats LOC: it's the cohesion signal
+                          and can't be cosmetically gamed (a re-export shim just
+                          moves the high count to the barrel).
   4. core→delta         : WARN — the trunk gained a NEW dependency on the delta
                           files (baseline graph vs post-commit graph — the only
                           place two snapshots are compared; opt-in via --baseline)
@@ -243,21 +246,49 @@ def _commit_files(repo: Path, sha: str) -> list:
     return files
 
 
-def hotspot_score(repo: Path, path: str, nodes: dict, min_fan_in: int = 20):
+def load_export_counts(graph_path: Path) -> dict:
     """
-    Hotspot score for a file = fan_in × loc × (churn_90d + 1).
-    Returns (score, fan_in, loc, churn). score is None when fan_in < min_fan_in
-    (only heavily-depended-on files can be a hotspot — a low-fan-in file, however
-    large/churny, isn't an over-coupled module). Shared by the gate (INV3) and the
-    standalone `codeindex hotspots` command.
+    Export-count per file from the sibling symbolindex.json (built by
+    `codeindex symbols`). Returns {file: n_exported_symbols}. Empty dict if the
+    symbol index is absent — callers fall back to a 1× multiplier so the score
+    degrades to fan_in × churn rather than crashing.
+    """
+    sym_path = graph_path.parent / "symbolindex.json"
+    if not sym_path.exists():
+        return {}
+    try:
+        data = json.loads(sym_path.read_text())
+    except (json.JSONDecodeError, OSError):
+        return {}
+    out = {}
+    for f, syms in data.get("file_symbols", {}).items():
+        out[f] = sum(1 for s in syms if s.get("exported"))
+    return out
+
+
+def hotspot_score(repo: Path, path: str, nodes: dict, exports: dict,
+                  min_fan_in: int = 20):
+    """
+    Hotspot score for a file = fan_in × exports × (churn_90d + 1).
+
+    Export-count (not LOC) is the surface signal: a cohesive seam has FEW exports
+    however many importers (cn.ts = 1 export / 108 importers — healthy); a junk
+    drawer has MANY exports bundled in one file (import.ts = 33 exports across 6
+    CSV domains — the smell). Export-count is also gaming-resistant: you cannot
+    lower it with a cosmetic re-export shim (the shim's barrel then carries the
+    high count), unlike LOC which a shim trivially reduces.
+
+    Returns (score, fan_in, exports, churn). score is None when fan_in < min_fan_in
+    (only heavily-depended-on files can be a hotspot). Shared by the gate (INV3)
+    and the standalone `codeindex hotspots` command.
     """
     n = nodes.get(path, {})
     fan_in = n.get("direct_dependents", 0) + n.get("transitive_dependents", 0)
-    loc = n.get("loc", 0)
+    n_exports = exports.get(path, 1) or 1  # fallback 1× when no symbol index
     if fan_in < min_fan_in:
-        return None, fan_in, loc, 0
+        return None, fan_in, n_exports, 0
     churn = _churn_90d(repo, path)
-    return fan_in * loc * (churn + 1), fan_in, loc, churn
+    return fan_in * n_exports * (churn + 1), fan_in, n_exports, churn
 
 
 def _churn_90d(repo: Path, path: str) -> int:
@@ -345,14 +376,15 @@ def evaluate(repo: Path, sha: str, graph_path: Path, rules: ArchRules,
                                      f"{s} → {t}  (rank {rs}→{rt}, edge points UP the stack)"))
 
     # INV3 — hotspot (WARN only; raw blast does NOT gate — high fan-in to a
-    # thin stable seam is healthy). Score = fan_in × loc × (churn_90d + 1).
+    # thin stable seam is healthy). Score = fan_in × exports × (churn_90d + 1).
+    exports = load_export_counts(graph_path)
     for f in delta:
-        score, fan_in, loc, churn = hotspot_score(repo, f, nodes)
+        score, fan_in, n_exp, churn = hotspot_score(repo, f, nodes, exports)
         if score is not None and score >= rules.hotspot_warn:
             findings.append(Finding(
                 "hotspot", "warn",
-                f"{f}  (fan-in {fan_in} × {loc} LOC × churn {churn} = {score}) "
-                f"— large, heavily-depended-on, churning; consider splitting"))
+                f"{f}  (fan-in {fan_in} × {n_exp} exports × churn {churn} = {score}) "
+                f"— heavily-depended-on, many exports, churning; low cohesion, consider splitting"))
 
     # INV4 — core→delta (baseline vs post-commit; only if analyze_fn given)
     if analyze_fn is not None:
