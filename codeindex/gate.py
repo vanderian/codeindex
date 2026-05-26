@@ -4,19 +4,50 @@ against a repo's machine-readable arch-rules.
 
 The gate answers the closed question "is this change architecturally legal?"
 with one true answer every run. It reads arch-rules (layer ranks + forbidden
-edges + blast budget) from a repo doc, builds/reads the dependency graph, and
-evaluates the touched files of a commit (the delta) against four invariants:
+edges + hotspot threshold) from a repo doc, builds/reads the dependency graph,
+and evaluates the touched files of a commit (the delta) against these checks:
 
-  1. layer-containment : no delta edge points UP the layer-rank stack
-  2. forbidden-edge     : no delta edge matches a §-backed forbidden rule
-  3. zone-of-pain       : WARN (never blocks) when a delta file is a
+  1. layer-containment : BLOCK — no delta edge points UP the layer-rank stack
+  2. forbidden-edge     : BLOCK — no delta edge matches a §-backed forbidden rule
+  3. hotspot            : WARN (never blocks) when a delta file is a
                           heavily-depended-on, large, churning module
                           (fan_in × loc × churn) — a split candidate. Raw blast
                           does NOT gate: high fan-in to a thin stable seam is
                           healthy (Martin's stable-dependency rule).
-  4. core→delta         : the trunk gained no NEW dependency on the delta files
-                          (baseline graph vs post-commit graph — the only
-                          place two snapshots are compared)
+  4. core→delta         : WARN — the trunk gained a NEW dependency on the delta
+                          files (baseline graph vs post-commit graph — the only
+                          place two snapshots are compared; opt-in via --baseline)
+
+Only layer-containment + forbidden-edge BLOCK (exit 1). hotspot + core→delta are
+advisory WARNs — the human ratifies; the gate never auto-relaxes itself. Cycle
+detection is intentionally NOT here — dep-cruiser/madge solve it deterministically
+without the graph; duplicating it would be a worse implementation of a solved
+problem.
+
+GAMING CAVEAT (load-bearing — read before changing hotspot's role):
+layer-containment + forbidden-edge are BINARY TOPOLOGICAL FACTS — an import edge
+either exists or it doesn't. To make the violation go away you must actually
+remove the illegal dependency; gaming == fixing. Safe to hard-gate.
+
+hotspot is a CONTINUOUS PROXY (fan_in × loc × churn) for an unmeasurable thing
+("is this module over-coupled?"). A proxy can be satisfied WITHOUT satisfying
+what it proxies: an optimizer can split a file cosmetically (a re-export shim
+that lowers per-file LOC while leaving transitive coupling identical) and the
+score drops while the architecture gets WORSE. Against an autonomous agent that
+treats the metric as a target, hard-gating hotspot is worse than no gate — it
+manufactures green-but-wrong (Goodhart). So:
+  - hotspot is WARN-only, and surfaced MONITOR→HUMAN only — never handed to the
+    impl/AFK agent as a gate to clear. The agent gets `impact` (read-only blast
+    thermometer), not a hotspot pass/fail. It can't optimize against a signal it
+    never sees. The goal of hotspot is IDENTIFICATION (name the god-object — an
+    easy refactor once named), not clearance.
+  - the metric IDENTIFIES; the human RATIFIES the fix. Never let the gate certify
+    that a hotspot was "addressed" — certification is the step an optimizer games.
+  - future hardening (principled, not yet built): a real split SEVERS transitive
+    edges (consumers' reach drops); a cosmetic shim leaves transitive coupling
+    FLAT. Comparing LOC-drop vs transitive-coupling-delta separates the two — but
+    a clever per-domain-barrel shim blurs even that, so it informs the human, it
+    doesn't auto-certify. Measure to find; let the human judge the fix.
 
 Cycle detection (the brief's 4th invariant) is intentionally NOT here — it is
 solved deterministically by dep-cruiser/madge without the graph; duplicating it
@@ -97,7 +128,7 @@ def _parse_arch_rules_stdlib(block: str) -> dict:
     text = re.sub(r",\s*\n\s*", ", ", text)
     text = re.sub(r",?\s*\n\s*\]", "]", text)
 
-    out: dict = {"layers": [], "forbidden": [], "zone_of_pain": {}}
+    out: dict = {"layers": [], "forbidden": [], "hotspot": {}}
     section = None
     cur: dict = {}
 
@@ -116,8 +147,8 @@ def _parse_arch_rules_stdlib(block: str) -> dict:
             flush(); section = "layers"; continue
         if stripped.startswith("forbidden:"):
             flush(); section = "forbidden"; continue
-        if stripped.startswith("zone_of_pain:"):
-            flush(); section = "pain"; continue
+        if stripped.startswith("hotspot:"):
+            flush(); section = "hotspot"; continue
         if section == "layers":
             if stripped.startswith("- rank:"):
                 flush()
@@ -132,9 +163,9 @@ def _parse_arch_rules_stdlib(block: str) -> dict:
                 cur["to"] = _split_list(stripped.split("to:", 1)[1])
             elif stripped.startswith("why:"):
                 cur["why"] = stripped.split("why:", 1)[1].strip().strip("'\"")
-        elif section == "pain":
+        elif section == "hotspot":
             if stripped.startswith("warn:"):
-                out["zone_of_pain"]["warn"] = int(stripped.split(":")[1].strip())
+                out["hotspot"]["warn"] = int(stripped.split(":")[1].strip())
     flush()
     return out
 
@@ -145,7 +176,7 @@ class ArchRules:
     rank_of_module: dict = field(default_factory=dict)   # "packages/db" -> 1
     rank_prefixes: list = field(default_factory=list)    # [("tools/", 5)]
     forbidden: list = field(default_factory=list)        # [{"from":..,"to":[..],"why":..}]
-    pain_warn: int = 150000                              # zone-of-pain WARN threshold
+    hotspot_warn: int = 150000                           # hotspot WARN threshold
 
     @classmethod
     def from_doc(cls, doc_path: Path) -> "ArchRules":
@@ -166,7 +197,7 @@ class ArchRules:
             rank_of_module=rank_of,
             rank_prefixes=sorted(prefixes, key=lambda kv: len(kv[0]), reverse=True),
             forbidden=data.get("forbidden", []),
-            pain_warn=int(data.get("zone_of_pain", {}).get("warn", 150000)),
+            hotspot_warn=int(data.get("hotspot", {}).get("warn", 150000)),
         )
 
     def rank(self, path: str) -> "int | None":
@@ -210,6 +241,23 @@ def _commit_files(repo: Path, sha: str) -> list:
             if f.endswith((".ts", ".tsx", ".js", ".jsx", ".css", ".sql")):
                 files.append(f)
     return files
+
+
+def hotspot_score(repo: Path, path: str, nodes: dict, min_fan_in: int = 20):
+    """
+    Hotspot score for a file = fan_in × loc × (churn_90d + 1).
+    Returns (score, fan_in, loc, churn). score is None when fan_in < min_fan_in
+    (only heavily-depended-on files can be a hotspot — a low-fan-in file, however
+    large/churny, isn't an over-coupled module). Shared by the gate (INV3) and the
+    standalone `codeindex hotspots` command.
+    """
+    n = nodes.get(path, {})
+    fan_in = n.get("direct_dependents", 0) + n.get("transitive_dependents", 0)
+    loc = n.get("loc", 0)
+    if fan_in < min_fan_in:
+        return None, fan_in, loc, 0
+    churn = _churn_90d(repo, path)
+    return fan_in * loc * (churn + 1), fan_in, loc, churn
 
 
 def _churn_90d(repo: Path, path: str) -> int:
@@ -296,20 +344,14 @@ def evaluate(repo: Path, sha: str, graph_path: Path, rules: ArchRules,
             findings.append(Finding("layer-containment", "block",
                                      f"{s} → {t}  (rank {rs}→{rt}, edge points UP the stack)"))
 
-    # INV3 — zone-of-pain (WARN only; raw blast does NOT gate — high fan-in to a
+    # INV3 — hotspot (WARN only; raw blast does NOT gate — high fan-in to a
     # thin stable seam is healthy). Score = fan_in × loc × (churn_90d + 1).
     for f in delta:
-        n = nodes.get(f, {})
-        fan_in = n.get("direct_dependents", 0) + n.get("transitive_dependents", 0)
-        loc = n.get("loc", 0)
-        if fan_in < 20:
-            continue  # only heavily-depended-on files can be a zone-of-pain
-        churn = _churn_90d(repo, f)
-        pain = fan_in * loc * (churn + 1)
-        if pain >= rules.pain_warn:
+        score, fan_in, loc, churn = hotspot_score(repo, f, nodes)
+        if score is not None and score >= rules.hotspot_warn:
             findings.append(Finding(
-                "zone-of-pain", "warn",
-                f"{f}  (fan-in {fan_in} × {loc} LOC × churn {churn} = {pain}) "
+                "hotspot", "warn",
+                f"{f}  (fan-in {fan_in} × {loc} LOC × churn {churn} = {score}) "
                 f"— large, heavily-depended-on, churning; consider splitting"))
 
     # INV4 — core→delta (baseline vs post-commit; only if analyze_fn given)

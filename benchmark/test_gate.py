@@ -7,7 +7,7 @@ Usage:
 
 Tests the gate's two parsers and three findings paths against a synthetic
 arch-rules doc + graph — no git repo needed for the parse/layer/forbidden/
-zone-of-pain checks (the core→delta baseline diff is exercised separately, it
+hotspot checks (the core→delta baseline diff is exercised separately, it
 needs a real repo + worktree).
 """
 from __future__ import annotations
@@ -62,7 +62,7 @@ forbidden:
   - from: apps/spa
     to: [packages/db]
     why: 'client must not reach the db layer'
-zone_of_pain:
+hotspot:
   warn: 100000
 ```
 """
@@ -90,8 +90,8 @@ def main():
             rules.rank("tools/scripts/x.ts") == 5)
     r.check("forbidden rule parsed (1 entry, not leaked from layers)",
             len(rules.forbidden) == 1 and rules.forbidden[0]["from"] == "apps/spa")
-    r.check("zone_of_pain warn parsed",
-            rules.pain_warn == 100000)
+    r.check("hotspot warn parsed",
+            rules.hotspot_warn == 100000)
 
     print("\nLayer-containment (upward edge = block):")
     r.check("db → schema is legal (1→0, down)",
@@ -108,14 +108,14 @@ def main():
     r.check("spa → contract is NOT forbidden",
             rules.forbidden_hit("apps/spa/src/x.tsx", "packages/contract/src/index.ts") is None)
 
-    print("\nZone-of-pain scoring (the metric, not a gate-run):")
+    print("\nHotspot scoring (the metric, not a gate-run):")
     # healthy seam: huge fan-in, tiny loc, no churn → LOW pain
     seam = 64 * 24 * (0 + 1)            # i18n-shaped
     god  = 209 * 1597 * (15 + 1)         # import.ts-shaped
     r.check("thin seam (64 fan-in × 24 LOC) scores below warn",
-            seam < rules.pain_warn, f"seam={seam}")
+            seam < rules.hotspot_warn, f"seam={seam}")
     r.check("god-module (209 × 1597 × churn) scores above warn",
-            god >= rules.pain_warn, f"god={god}")
+            god >= rules.hotspot_warn, f"god={god}")
 
     sys.exit(r.summary())
 

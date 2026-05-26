@@ -1,0 +1,92 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# arch-rules — the machine-readable input to `codeindex gate`
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# This is the CANONICAL schema reference. The gate reads a ```yaml block in the
+# shape below; it does not have to be a standalone file. In practice you embed
+# this block inside an architecture doc the gate points at:
+#
+#     codeindex gate <sha> --rules docs/audit-arch.md
+#
+# The gate extracts the FIRST ```yaml fenced block that contains a `layers:`
+# key. So you can keep the arch-rules next to prose explaining them, and the
+# gate finds the machine part automatically.
+#
+# Three sections — all optional, but `layers` is what makes the block findable:
+#   layers     — the dependency-rank partial order (drives layer-containment)
+#   forbidden  — hard trust-boundary edges that override rank
+#   hotspot    — the over-coupling WARN threshold
+#
+# DERIVE, don't assert. Ranks should come from the real graph, not a guess:
+#   codeindex analyze . --output codeindex.json
+#   # then inspect who-imports-whom; a module imported-by-many that imports-few
+#   # sits LOW, the reverse sits HIGH. A guessed rank that's wrong shows up as a
+#   # gate false-flag on a clean commit — that misfire is how you correct it.
+#
+# The numbers and module names below are ILLUSTRATIVE (a generic TS monorepo).
+# Replace them with your repo's real modules + thresholds.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ── layers — dependency-rank partial order ───────────────────────────────────
+# An edge A → B is LEGAL only if rank(B) <= rank(A): you may depend DOWNWARD or
+# sideways, never UP the stack. Lower rank = closer to the base (depended-on by
+# many, depends on little). An upward edge is a layer-containment BLOCK.
+#
+# A module is matched by exact top-2-path ("packages/db") or by a trailing-slash
+# PREFIX ("tools/" matches tools/anything). Longest prefix wins. A path the gate
+# can't rank is reported as a coverage WARN (not a silent pass) — so every
+# product module should appear here.
+layers:
+  # rank 0 — base leaves: imported widely, import nothing internal (types,
+  # schema, config, pure contracts). The foundation.
+  - rank: 0
+    modules: [packages/schema, packages/config, packages/contract]
+  # rank 1 — infra libs that depend only on rank-0 (db access, i18n, mailer).
+  - rank: 1
+    modules: [packages/db, packages/i18n]
+  # rank 2 — domain libs that use the infra layer (e.g. an authz lib that
+  # imports db + schema). DERIVE this — a lib you'd assume is a "leaf" often
+  # sits here because it actually consumes the db layer.
+  - rank: 2
+    modules: [packages/authz]
+  # rank 3 — applications (the trunk; imported by ~nothing internal).
+  - rank: 3
+    modules: [apps/web, apps/spa]
+  # rank 4 — preview / dev apps built on top of the real apps.
+  - rank: 4
+    modules: [apps/playground]
+  # rank 5 — tooling + test harness (off the product path; may reach anything).
+  - rank: 5
+    modules: [tools/, packages/test-utils]
+
+# ── forbidden — hard trust-boundary edges (override rank) ─────────────────────
+# Some illegal edges are "down the stack" by rank but still wrong — a trust
+# boundary rank alone can't express. These are BLOCKs regardless of rank.
+# `from` matches the source path PREFIX; `to` is a list of forbidden target
+# prefixes; `why` is surfaced in the finding (cite the rule/§ that backs it).
+forbidden:
+  - from: apps/spa
+    to: [packages/db]
+    why: "client bundle must never reach the server-only db layer"
+  - from: packages/contract
+    to: [apps/, packages/db]
+    why: "contract is a pure-types leaf; it must not depend up or on the driver"
+  - from: packages/schema
+    to: [apps/, packages/]
+    why: "schema is the base layer; it depends on nothing internal"
+
+# ── hotspot — over-coupling WARN threshold (never blocks) ─────────────────────
+# Raw fan-in does NOT gate: a thin, stable, heavily-imported seam (a 20-line
+# helper everything calls) is HEALTHY architecture, not a smell. The smell is
+# the god-module: heavily-depended-on AND large AND churning. The gate scores
+#     hotspot = fan_in × loc × (churn_90d + 1)
+# and WARNs (advisory — the human ratifies; splitting purely to pass is NOT the
+# goal) when a touched file exceeds `warn`. Calibrate from your repo:
+#     codeindex hotspots          # see the real distribution, pick a threshold
+#                                 # that sits ABOVE your healthy seams and BELOW
+#                                 # your real god-modules.
+hotspot:
+  warn: 150000
+  # No `block:` — hotspot is advisory by design. Only layer-containment +
+  # forbidden edges hard-block. Raw blast stays a read-only impl pre-flight
+  # (`codeindex impact <file>`), never a gate.

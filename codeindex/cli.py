@@ -343,6 +343,17 @@ def _build_parser() -> argparse.ArgumentParser:
     p_hook.add_argument("--strict", action="store_true", help="Block commit when threshold exceeded")
     p_hook.add_argument("--remove", action="store_true", help="Remove the installed hook")
 
+    # ── hotspots ──────────────────────────────────────────────────────────
+    p_hot = sub.add_parser(
+        "hotspots",
+        help="Rank files by hotspot score (fan-in × LOC × churn) — over-coupled split candidates")
+    p_hot.add_argument("--repo", default=".", help="Repo root (default: .)")
+    p_hot.add_argument("--index", help="Path to codeindex.json (auto-discovered if omitted)")
+    p_hot.add_argument("--threshold", type=int, default=0,
+                       help="Minimum hotspot score to list (default: 0 = show all with fan-in ≥ 20)")
+    p_hot.add_argument("--limit", type=int, default=20, help="Max rows (default: 20)")
+    p_hot.add_argument("--json", action="store_true", help="Output raw JSON")
+
     # ── gate ──────────────────────────────────────────────────────────────
     p_gate = sub.add_parser(
         "gate",
@@ -356,6 +367,41 @@ def _build_parser() -> argparse.ArgumentParser:
     p_gate.add_argument("--json", action="store_true", help="Output findings as JSON")
 
     return parser
+
+
+def _cmd_hotspots(args: argparse.Namespace) -> None:
+    from codeindex import gate as gatemod
+
+    repo = Path(args.repo).resolve()
+    graph_path = Path(args.index) if args.index else repo / "codeindex.json"
+    if not graph_path.exists():
+        print(f"graph not found: {graph_path} — run `codeindex analyze` first", file=sys.stderr)
+        sys.exit(2)
+
+    data = json.loads(graph_path.read_text())
+    nodes = {n["id"]: n for n in data.get("nodes", [])}
+
+    rows = []
+    for nid in nodes:
+        if not nid.startswith(gatemod.INTERNAL_PREFIXES):
+            continue
+        score, fan_in, loc, churn = gatemod.hotspot_score(repo, nid, nodes)
+        if score is not None and score >= args.threshold:
+            rows.append({"file": nid, "score": score, "fan_in": fan_in,
+                         "loc": loc, "churn": churn})
+    rows.sort(key=lambda r: r["score"], reverse=True)
+    rows = rows[: args.limit]
+
+    if args.json:
+        print(json.dumps(rows, indent=2))
+        return
+    if not rows:
+        print("No hotspots (no file with fan-in ≥ 20 above the threshold).")
+        return
+    print(f"Hotspots — fan-in × LOC × churn(90d), top {len(rows)}:")
+    print(f"  {'score':>10}  {'fanin':>5} {'loc':>5} {'churn':>5}  file")
+    for r in rows:
+        print(f"  {r['score']:>10}  {r['fan_in']:>5} {r['loc']:>5} {r['churn']:>5}  {r['file']}")
 
 
 def _cmd_gate(args: argparse.Namespace) -> None:
@@ -420,6 +466,7 @@ def main() -> None:
         "dependencies": _cmd_dependencies,
         "high-blast":   _cmd_high_blast,
         "install-hook": _cmd_install_hook,
+        "hotspots":     _cmd_hotspots,
         "gate":         _cmd_gate,
     }
     dispatch[args.command](args)
